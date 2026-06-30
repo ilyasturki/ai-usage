@@ -70,6 +70,21 @@ func run(args []string) int {
 		Now:         time.Now,
 		Out:         os.Stdout,
 		Err:         os.Stderr,
+		Color:       colorEnabled(os.Stdout),
 	}
 	return app.Run(deps, mode)
+}
+
+// colorEnabled reports whether ANSI color should be written to f: only when f is
+// a terminal and the environment does not opt out via NO_COLOR or TERM=dumb. So
+// piping `ai-usage` into a file or another command yields plain, unstyled text.
+func colorEnabled(f *os.File) bool {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }

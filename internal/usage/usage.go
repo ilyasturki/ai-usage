@@ -13,7 +13,7 @@ type Window struct {
 	Utilization float64
 	// ResetsAt is the absolute reset time, or nil when the provider reports
 	// no reset for this window. The renderer turns it into a relative
-	// "resets in Xh YYm" countdown against the injected clock.
+	// "resets in 2 hours 30 minutes" countdown against the injected clock.
 	ResetsAt *time.Time
 }
 

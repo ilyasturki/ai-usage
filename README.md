@@ -5,19 +5,22 @@ no new session, no `curl | jq | python3` pipeline.
 
 ```
 $ ai-usage
-Claude
-  5-hour         [##------------------]  14.0%  resets in 1h48m
-  Weekly         [#########-----------]  49.0%  resets in 1h58m
-  Weekly Sonnet  [--------------------]   0.0%
+━━━ Claude ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5-hour        ██░░░░░░░░░░░░░░░░░░     14.0%   resets in 1 hour 48 minutes
+  Weekly        █████████░░░░░░░░░░░     49.0%   resets in 1 hour 58 minutes
+  Weekly Sonnet ░░░░░░░░░░░░░░░░░░░░      0.0%
 
-Codex
-  5-hour         [####################] 100.0%  resets in 0h00m
-  Weekly         [########------------]  42.0%  resets in 0h00m
-  Credits        unlimited
+━━━ Codex ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5-hour        ████████████████████    100.0%   resets now
+  Weekly        ████████░░░░░░░░░░░░     42.0%   resets now
+  Credits       unlimited
 ```
 
-Each window is a 20-character bar (one block per 5%) with utilization and a
-reset countdown. Windows with no data are omitted.
+Each window is a 20-character bar (one block per 5%) showing utilization and the
+time until it resets. When writing to a
+terminal the bars are color-coded by how full they are — green, then yellow,
+then red — and dropped to plain text when piped or under `NO_COLOR`. Windows
+with no data are omitted.
 
 ## Usage
 

@@ -9,10 +9,17 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"ai-usage/internal/render"
 )
 
 // clock is the fixed "now" all reset countdowns are computed against.
 var clock = time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+
+// hdr is the section rule the combined view prints above each provider. Its
+// exact form is pinned by the render package's own tests; here it just keeps the
+// expected output readable without embedding a wall of box-drawing characters.
+func hdr(name string) string { return render.New(false).Header(name) }
 
 const healthyClaudeJSON = `{
 	"five_hour":        {"utilization": 42.5, "resets_at": "2026-06-30T14:30:00Z"},
@@ -100,15 +107,15 @@ func TestCombinedHealthy(t *testing.T) {
 	code := Run(d, ModeCombined)
 
 	want := join(
-		"Claude",
-		"  5-hour         [########------------]  42.5%  resets in 2h30m",
-		"  Weekly         [##------------------]  10.0%  resets in 108h00m",
-		"  Weekly Opus    [--------------------]   0.0%  resets in 108h00m",
+		hdr("Claude"),
+		"  5-hour        ████████░░░░░░░░░░░░     42.5%   resets in 2 hours 30 minutes",
+		"  Weekly        ██░░░░░░░░░░░░░░░░░░     10.0%   resets in 4 days 12 hours",
+		"  Weekly Opus   ░░░░░░░░░░░░░░░░░░░░      0.0%   resets in 4 days 12 hours",
 		"",
-		"Codex",
-		"  5-hour         [###########---------]  55.0%  resets in 1h00m",
-		"  Weekly         [#-------------------]   8.0%  resets in 48h15m",
-		"  Credits        42",
+		hdr("Codex"),
+		"  5-hour        ███████████░░░░░░░░░     55.0%   resets in 1 hour",
+		"  Weekly        █░░░░░░░░░░░░░░░░░░░      8.0%   resets in 2 days",
+		"  Credits       42",
 	)
 	if out.String() != want {
 		t.Errorf("combined output mismatch:\n got:\n%s\nwant:\n%s", out.String(), want)
@@ -138,9 +145,9 @@ func TestClaudeOnly(t *testing.T) {
 	code := Run(d, ModeClaude)
 
 	want := join(
-		"5-hour         [########------------]  42.5%  resets in 2h30m",
-		"Weekly         [##------------------]  10.0%  resets in 108h00m",
-		"Weekly Opus    [--------------------]   0.0%  resets in 108h00m",
+		"5-hour        ████████░░░░░░░░░░░░     42.5%   resets in 2 hours 30 minutes",
+		"Weekly        ██░░░░░░░░░░░░░░░░░░     10.0%   resets in 4 days 12 hours",
+		"Weekly Opus   ░░░░░░░░░░░░░░░░░░░░      0.0%   resets in 4 days 12 hours",
 	)
 	if out.String() != want {
 		t.Errorf("claude-only output mismatch:\n got:\n%s\nwant:\n%s", out.String(), want)
@@ -158,12 +165,41 @@ func TestCodexOnly(t *testing.T) {
 	code := Run(d, ModeCodex)
 
 	want := join(
-		"5-hour         [###########---------]  55.0%  resets in 1h00m",
-		"Weekly         [#-------------------]   8.0%  resets in 48h15m",
-		"Credits        42",
+		"5-hour        ███████████░░░░░░░░░     55.0%   resets in 1 hour",
+		"Weekly        █░░░░░░░░░░░░░░░░░░░      8.0%   resets in 2 days",
+		"Credits       42",
 	)
 	if out.String() != want {
 		t.Errorf("codex-only output mismatch:\n got:\n%s\nwant:\n%s", out.String(), want)
+	}
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+}
+
+func TestCodexStaleSnapshotReportsReset(t *testing.T) {
+	// The user's real situation: the newest snapshot is days old and both
+	// windows have since reset. They must read 0% with no countdown, not the
+	// stale 100%/42% recorded at capture time.
+	stale := fmt.Sprintf(`{"timestamp":"2026-06-16T20:34:24Z","payload":{"type":"token_count","rate_limits":{`+
+		`"primary":{"used_percent":100.0,"resets_at":%d,"window_minutes":300},`+
+		`"secondary":{"used_percent":42.0,"resets_at":%d,"window_minutes":10080},`+
+		`"credits":{"has_credits":false,"unlimited":false,"balance":"0"}}}}`,
+		clock.Add(-13*24*time.Hour).Unix(), clock.Add(-6*24*time.Hour).Unix())
+
+	var out, errOut bytes.Buffer
+	d := baseDeps(&out, &errOut)
+	d.SessionsDir = sessionsWith(t, map[string]string{"a.jsonl": stale}, []string{"a.jsonl"})
+
+	code := Run(d, ModeCodex)
+
+	want := join(
+		"5-hour        ░░░░░░░░░░░░░░░░░░░░      0.0%",
+		"Weekly        ░░░░░░░░░░░░░░░░░░░░      0.0%",
+		"Credits       0",
+	)
+	if out.String() != want {
+		t.Errorf("stale codex output mismatch:\n got:\n%s\nwant:\n%s", out.String(), want)
 	}
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
@@ -181,13 +217,13 @@ func TestExpiredTokenInCombinedStillShowsCodex(t *testing.T) {
 	code := Run(d, ModeCombined)
 
 	want := join(
-		"Claude",
+		hdr("Claude"),
 		"  claude-usage: token may be expired - open Claude once to refresh",
 		"",
-		"Codex",
-		"  5-hour         [###########---------]  55.0%  resets in 1h00m",
-		"  Weekly         [#-------------------]   8.0%  resets in 48h15m",
-		"  Credits        42",
+		hdr("Codex"),
+		"  5-hour        ███████████░░░░░░░░░     55.0%   resets in 1 hour",
+		"  Weekly        █░░░░░░░░░░░░░░░░░░░      8.0%   resets in 2 days",
+		"  Credits       42",
 	)
 	if out.String() != want {
 		t.Errorf("output mismatch:\n got:\n%s\nwant:\n%s", out.String(), want)
@@ -208,13 +244,13 @@ func TestMissingCredentialsInCombined(t *testing.T) {
 	code := Run(d, ModeCombined)
 
 	want := join(
-		"Claude",
+		hdr("Claude"),
 		"  claude-usage: "+missing+" not found",
 		"",
-		"Codex",
-		"  5-hour         [###########---------]  55.0%  resets in 1h00m",
-		"  Weekly         [#-------------------]   8.0%  resets in 48h15m",
-		"  Credits        42",
+		hdr("Codex"),
+		"  5-hour        ███████████░░░░░░░░░     55.0%   resets in 1 hour",
+		"  Weekly        █░░░░░░░░░░░░░░░░░░░      8.0%   resets in 2 days",
+		"  Credits       42",
 	)
 	if out.String() != want {
 		t.Errorf("output mismatch:\n got:\n%s\nwant:\n%s", out.String(), want)
