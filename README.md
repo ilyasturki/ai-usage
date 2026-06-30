@@ -40,7 +40,12 @@ cleanly.
   you get a clear "open Claude once to refresh" message.
 - **Codex** reads the rate-limit snapshots Codex already writes to its session
   logs under `~/.codex/sessions` (honoring `$CODEX_HOME`), newest file first —
-  so checking usage doesn't start a session of its own.
+  so checking usage doesn't start a session of its own. Only the tail of each
+  log is read (the latest snapshot lives at the end), so it stays fast even when
+  sessions grow to hundreds of MB. Because the snapshot is a point in time, a
+  window whose reset has already passed reads `0.0%`: it rolled over since the
+  snapshot, and no newer usage means no newer snapshot — so a Codex you haven't
+  touched in days shows empty windows rather than a stale percentage.
 
 Both upstreams are undocumented and have shifted between releases; this tool
 trades clear errors and a fast test loop for that, not immunity.

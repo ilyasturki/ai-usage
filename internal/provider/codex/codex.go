@@ -26,17 +26,34 @@ import (
 // it is skipped and the scan continues rather than aborting the file.
 const maxLineBytes = 16 * 1024 * 1024
 
+// tailWindowBytes bounds the fast path. Session logs are append-only and the
+// newest snapshot sits near the end, so only this many trailing bytes are
+// scanned first; a file whose tail holds no snapshot falls back to a full scan.
+// This trades a rare full read for not reading hundreds of MB on every call —
+// real session files reach hundreds of MB, and a front-to-back scan of the
+// newest one was the whole reason `codex` took seconds to print.
+const tailWindowBytes = 4 * 1024 * 1024
+
 // ErrNoSnapshot is returned when no session file yields a rate-limit snapshot.
 var ErrNoSnapshot = errors.New("codex-usage: no Codex rate-limit snapshot found")
 
 // Provider scans the Codex sessions directory for the latest rate-limit
-// snapshot. SessionsDir is injected so tests can point at a fixture tree.
+// snapshot. SessionsDir is injected so tests can point at a fixture tree, and
+// Now is injected so staleness correction is deterministic under test.
 type Provider struct {
 	SessionsDir string
+	Now         func() time.Time // current time for staleness; nil means time.Now
 }
 
 // Name is the combined-view header for this provider.
 func (p *Provider) Name() string { return "Codex" }
+
+func (p *Provider) now() time.Time {
+	if p.Now != nil {
+		return p.Now()
+	}
+	return time.Now()
+}
 
 // Fetch finds the newest session file (by mtime) that carries a rate-limit
 // snapshot and renders it. The first file yielding a snapshot wins.
@@ -52,17 +69,45 @@ func (p *Provider) Fetch() (usage.Result, error) {
 	}
 
 	for _, path := range paths {
-		f, err := os.Open(path)
-		if err != nil {
+		raw, ok := snapshotFromFile(path, tailWindowBytes)
+		if !ok {
 			continue
 		}
-		raw, ok := latestRateLimits(f)
-		f.Close()
-		if ok {
-			return ParseRateLimits(raw)
+		res, err := ParseRateLimits(raw)
+		if err != nil {
+			return usage.Result{}, err
 		}
+		return adjustForReset(res, p.now()), nil
 	}
 	return usage.Result{}, ErrNoSnapshot
+}
+
+// snapshotFromFile returns the latest rate-limit snapshot in one session file.
+// It scans only the final tailWindow bytes first — the newest snapshot sits
+// near the end of an append-only log — and falls back to a full scan when that
+// tail holds no snapshot. Seeking mid-file lands inside a line whose truncated
+// JSON simply fails to parse and is skipped, so the partial first line is
+// harmless. tailWindow is a parameter so tests drive both paths cheaply.
+func snapshotFromFile(path string, tailWindow int64) (json.RawMessage, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+
+	// Fast path: the newest snapshot sits near EOF, so scan only the tail.
+	if info, err := f.Stat(); err == nil && info.Size() > tailWindow {
+		if _, err := f.Seek(info.Size()-tailWindow, io.SeekStart); err == nil {
+			if raw, ok := latestRateLimits(f); ok {
+				return raw, true
+			}
+		}
+	}
+	// Fallback: rewind and scan the whole file.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, false
+	}
+	return latestRateLimits(f)
 }
 
 // jsonlFilesByMtimeDesc lists every *.jsonl file under root, newest mtime
@@ -212,6 +257,25 @@ func ParseRateLimits(raw json.RawMessage) (usage.Result, error) {
 	return usage.Result{Windows: windows, Extras: extras}, nil
 }
 
+// adjustForReset corrects for the snapshot being a point-in-time record. A
+// window whose reset has already passed (relative to now) has rolled over to a
+// fresh window since the snapshot was written; because any newer usage would
+// have produced a newer snapshot, that window is now empty — reported as 0%
+// with no pending countdown. Windows not yet reset keep their recorded
+// utilization, since usage only accumulates within a window. This is why a
+// 5-hour window last seen at 100% reads 0% once its reset has passed, rather
+// than showing a stale 100% with a "resets now" countdown.
+func adjustForReset(r usage.Result, now time.Time) usage.Result {
+	for i := range r.Windows {
+		w := &r.Windows[i]
+		if w.ResetsAt != nil && !w.ResetsAt.After(now) {
+			w.Utilization = 0
+			w.ResetsAt = nil
+		}
+	}
+	return r
+}
+
 // parseLimit reads one rate-limit window. A missing/non-numeric used_percent
 // omits the window. The label derives from window_minutes, falling back to the
 // given name. A zero/missing resets_at yields no countdown.
@@ -259,7 +323,9 @@ func windowLabel(raw json.RawMessage, fallback string) string {
 }
 
 // parseCredits reads the optional credits line: "unlimited" when the flag is
-// set, otherwise the raw balance value when present and non-null.
+// set, otherwise the balance value when present and non-null. Codex encodes the
+// balance as either a JSON number or a JSON string (e.g. "0"), so both are
+// accepted.
 func parseCredits(raw json.RawMessage) (usage.Extra, bool) {
 	obj, ok := asObject(raw)
 	if !ok {
@@ -268,13 +334,28 @@ func parseCredits(raw json.RawMessage) (usage.Extra, bool) {
 	if unlimited, ok := jsonBool(obj["unlimited"]); ok && unlimited {
 		return usage.Extra{Label: "Credits", Value: "unlimited"}, true
 	}
-	if bal := obj["balance"]; len(bal) > 0 {
-		var n json.Number
-		if json.Unmarshal(bal, &n) == nil && n != "" {
-			return usage.Extra{Label: "Credits", Value: n.String()}, true
-		}
+	if v, ok := scalarString(obj["balance"]); ok {
+		return usage.Extra{Label: "Credits", Value: v}, true
 	}
 	return usage.Extra{}, false
+}
+
+// scalarString renders a balance the way the reference `f"{balance}"` did: a
+// JSON string yields its contents, a number its literal text (so 100.0 stays
+// "100.0"). null, absent, and non-scalar values report not-ok.
+func scalarString(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return "", false
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s, true
+	}
+	var n json.Number
+	if json.Unmarshal(raw, &n) == nil && n != "" {
+		return n.String(), true
+	}
+	return "", false
 }
 
 func parseTimestamp(s string) (time.Time, bool) {

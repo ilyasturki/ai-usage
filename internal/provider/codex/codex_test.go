@@ -3,6 +3,8 @@ package codex
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -235,6 +237,95 @@ func TestResetsAtConvertedFromEpoch(t *testing.T) {
 func TestParseRateLimitsNonObjectIsNoSnapshot(t *testing.T) {
 	if _, err := ParseRateLimits([]byte(`"not an object"`)); !errors.Is(err, ErrNoSnapshot) {
 		t.Errorf("ParseRateLimits() error = %v, want ErrNoSnapshot", err)
+	}
+}
+
+func TestParseRateLimitsStringBalance(t *testing.T) {
+	// Real Codex snapshots encode the credit balance as a JSON string.
+	raw := []byte(`{"primary":{"used_percent":1.0},"credits":{"has_credits":false,"unlimited":false,"balance":"0"}}`)
+	res, err := ParseRateLimits(raw)
+	if err != nil {
+		t.Fatalf("ParseRateLimits() error = %v", err)
+	}
+	if len(res.Extras) != 1 || res.Extras[0].Value != "0" {
+		t.Fatalf("extras = %+v, want one credits/\"0\"", res.Extras)
+	}
+}
+
+func TestAdjustForResetZeroesExpiredWindows(t *testing.T) {
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Hour)
+	future := now.Add(time.Hour)
+	r := usage.Result{Windows: []usage.Window{
+		{Label: "5-hour", Utilization: 100, ResetsAt: &past},
+		{Label: "Weekly", Utilization: 42, ResetsAt: &future},
+		{Label: "NoReset", Utilization: 7, ResetsAt: nil},
+	}}
+
+	got := adjustForReset(r, now)
+
+	if got.Windows[0].Utilization != 0 || got.Windows[0].ResetsAt != nil {
+		t.Errorf("expired window = %+v, want 0%% and no countdown", got.Windows[0])
+	}
+	if got.Windows[1].Utilization != 42 || got.Windows[1].ResetsAt == nil {
+		t.Errorf("future window = %+v, want untouched 42%% with countdown", got.Windows[1])
+	}
+	if got.Windows[2].Utilization != 7 || got.Windows[2].ResetsAt != nil {
+		t.Errorf("no-reset window = %+v, want untouched 7%%", got.Windows[2])
+	}
+}
+
+func TestAdjustForResetTreatsResetAtNowAsExpired(t *testing.T) {
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	at := now
+	r := usage.Result{Windows: []usage.Window{{Label: "5-hour", Utilization: 80, ResetsAt: &at}}}
+	if got := adjustForReset(r, now); got.Windows[0].Utilization != 0 || got.Windows[0].ResetsAt != nil {
+		t.Errorf("reset exactly at now = %+v, want 0%% and no countdown", got.Windows[0])
+	}
+}
+
+func TestSnapshotFromFilePrefersTail(t *testing.T) {
+	// The newest snapshot sits near EOF; scanning only a small tail window must
+	// still find it (and prefer it over an older snapshot before the window).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	older := `{"timestamp":"2026-06-30T10:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0}}}}`
+	newer := `{"timestamp":"2026-06-30T12:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":99.0}}}}`
+	filler := strings.Repeat("x", 4096) // pushes `older` outside the 256-byte tail window
+	content := older + "\n" + filler + "\n" + newer + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, ok := snapshotFromFile(path, 256)
+	if !ok {
+		t.Fatal("snapshotFromFile() ok = false, want the tail snapshot")
+	}
+	res, _ := ParseRateLimits(raw)
+	if res.Windows[0].Utilization != 99.0 {
+		t.Errorf("utilization = %v, want 99.0 (newest, found via tail)", res.Windows[0].Utilization)
+	}
+}
+
+func TestSnapshotFromFileFallsBackWhenTailHasNoSnapshot(t *testing.T) {
+	// The only snapshot is at the start of the file; the tail window covers
+	// trailing filler with no snapshot, so the full-scan fallback must find it.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	snap := `{"timestamp":"2026-06-30T10:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":44.0}}}}`
+	filler := strings.Repeat("x", 4096)
+	content := snap + "\n" + filler + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, ok := snapshotFromFile(path, 256)
+	if !ok {
+		t.Fatal("snapshotFromFile() ok = false; full-scan fallback did not run")
+	}
+	res, _ := ParseRateLimits(raw)
+	if res.Windows[0].Utilization != 44.0 {
+		t.Errorf("utilization = %v, want 44.0 (found via full-scan fallback)", res.Windows[0].Utilization)
 	}
 }
 
