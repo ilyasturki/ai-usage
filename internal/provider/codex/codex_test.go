@@ -178,6 +178,42 @@ func TestLatestRateLimitsLargeLineIsRead(t *testing.T) {
 	}
 }
 
+func TestScanRateLimitsOversizedLineSkippedScanContinues(t *testing.T) {
+	// An over-cap line sits between an older and a newer snapshot. The scan
+	// must skip it and still reach (and prefer) the newer snapshot after it —
+	// not abort the file at the oversized line.
+	older := `{"timestamp":"2026-06-30T10:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0}}}}`
+	newer := `{"timestamp":"2026-06-30T12:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":99.0}}}}`
+	oversized := strings.Repeat("x", 512) // exceeds the 256-byte cap below
+	content := older + "\n" + oversized + "\n" + newer + "\n"
+
+	raw, ok := scanRateLimits(strings.NewReader(content), 256)
+	if !ok {
+		t.Fatal("scanRateLimits() ok = false; the scan aborted at the oversized line")
+	}
+	res, _ := ParseRateLimits(raw)
+	if res.Windows[0].Utilization != 99.0 {
+		t.Errorf("utilization = %v, want 99.0 (newer snapshot after the oversized line)", res.Windows[0].Utilization)
+	}
+}
+
+func TestScanRateLimitsOversizedLineBeforeOnlySnapshot(t *testing.T) {
+	// The newest file's first line is oversized; the snapshot after it must
+	// still be found (so Fetch does not needlessly fall through to an older file).
+	oversized := strings.Repeat("y", 512)
+	snap := `{"timestamp":"2026-06-30T11:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":44.0}}}}`
+	content := oversized + "\n" + snap + "\n"
+
+	raw, ok := scanRateLimits(strings.NewReader(content), 256)
+	if !ok {
+		t.Fatal("scanRateLimits() ok = false; the oversized first line aborted the scan")
+	}
+	res, _ := ParseRateLimits(raw)
+	if res.Windows[0].Utilization != 44.0 {
+		t.Errorf("utilization = %v, want 44.0", res.Windows[0].Utilization)
+	}
+}
+
 func TestLatestRateLimitsNoSnapshot(t *testing.T) {
 	if _, ok := latestRateLimits(strings.NewReader("{}\n{\"payload\":{\"type\":\"x\"}}")); ok {
 		t.Error("latestRateLimits() ok = true, want false when there is no token_count snapshot")

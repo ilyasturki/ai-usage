@@ -22,8 +22,8 @@ import (
 )
 
 // maxLineBytes caps a single jsonl line. Codex lines routinely exceed bufio's
-// 64 KB default, so the buffer is enlarged to read them; a line beyond even
-// this is skipped rather than crashing the scan.
+// 64 KB default, so lines are read at any length up to this cap; a line beyond
+// it is skipped and the scan continues rather than aborting the file.
 const maxLineBytes = 16 * 1024 * 1024
 
 // ErrNoSnapshot is returned when no session file yields a rate-limit snapshot.
@@ -105,47 +105,87 @@ func jsonlFilesByMtimeDesc(root string) ([]string, error) {
 }
 
 // latestRateLimits scans one session file and returns the rate_limits object
-// from the token_count event with the latest timestamp. Malformed lines are
-// skipped; an oversized line ends the scan gracefully with whatever was found.
+// from the token_count event with the latest timestamp. Lines are read at any
+// length up to maxLineBytes; malformed lines and lines beyond that cap are both
+// skipped while the scan continues, so one bad line never aborts the file or
+// discards snapshots found before or after it.
 func latestRateLimits(r io.Reader) (json.RawMessage, bool) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
+	return scanRateLimits(r, maxLineBytes)
+}
+
+// scanRateLimits is latestRateLimits with an injectable line cap so the
+// oversized-line path can be exercised in tests without a multi-megabyte fixture.
+func scanRateLimits(r io.Reader, maxLine int) (json.RawMessage, bool) {
+	br := bufio.NewReaderSize(r, 64*1024)
 
 	var current json.RawMessage
 	var currentAt time.Time
 	var haveCurrent, haveCurrentAt bool
 
-	for sc.Scan() {
-		var ev struct {
-			Timestamp string          `json:"timestamp"`
-			Payload   json.RawMessage `json:"payload"`
+	for {
+		line, tooLong, err := readLine(br, maxLine)
+		if len(line) > 0 && !tooLong {
+			if rl, at, atOK, ok := parseEventLine(line); ok {
+				// Take the first snapshot unconditionally, then replace only
+				// with a strictly newer, parseable timestamp.
+				if !haveCurrent || (atOK && (!haveCurrentAt || at.After(currentAt))) {
+					current = rl
+					haveCurrent = true
+					currentAt, haveCurrentAt = at, atOK
+				}
+			}
 		}
-		if json.Unmarshal(sc.Bytes(), &ev) != nil {
-			continue
-		}
-		var payload struct {
-			Type       string          `json:"type"`
-			RateLimits json.RawMessage `json:"rate_limits"`
-		}
-		if json.Unmarshal(ev.Payload, &payload) != nil {
-			continue
-		}
-		if payload.Type != "token_count" || !isJSONObject(payload.RateLimits) {
-			continue
-		}
-
-		at, atOK := parseTimestamp(ev.Timestamp)
-		// Take the first snapshot unconditionally, then replace only with a
-		// strictly newer, parseable timestamp.
-		if !haveCurrent || (atOK && (!haveCurrentAt || at.After(currentAt))) {
-			current = payload.RateLimits
-			haveCurrent = true
-			currentAt, haveCurrentAt = at, atOK
+		if err != nil {
+			break
 		}
 	}
-	// sc.Err() (e.g. a line past maxLineBytes) is intentionally ignored so one
-	// bad line doesn't discard the snapshots already collected.
 	return current, haveCurrent
+}
+
+// parseEventLine extracts the rate_limits object and event timestamp from one
+// jsonl line, reporting ok=false for anything that is not a token_count event
+// carrying a rate_limits object.
+func parseEventLine(line []byte) (rl json.RawMessage, at time.Time, atOK, ok bool) {
+	var ev struct {
+		Timestamp string          `json:"timestamp"`
+		Payload   json.RawMessage `json:"payload"`
+	}
+	if json.Unmarshal(line, &ev) != nil {
+		return nil, time.Time{}, false, false
+	}
+	var payload struct {
+		Type       string          `json:"type"`
+		RateLimits json.RawMessage `json:"rate_limits"`
+	}
+	if json.Unmarshal(ev.Payload, &payload) != nil {
+		return nil, time.Time{}, false, false
+	}
+	if payload.Type != "token_count" || !isJSONObject(payload.RateLimits) {
+		return nil, time.Time{}, false, false
+	}
+	at, atOK = parseTimestamp(ev.Timestamp)
+	return payload.RateLimits, at, atOK, true
+}
+
+// readLine reads the next newline-delimited line of any length. A line whose
+// length would exceed maxLine is consumed and discarded (tooLong = true) so the
+// caller can skip it and keep scanning. err is io.EOF once the stream is done.
+func readLine(br *bufio.Reader, maxLine int) (line []byte, tooLong bool, err error) {
+	for {
+		frag, e := br.ReadSlice('\n')
+		if !tooLong {
+			if len(line)+len(frag) > maxLine {
+				tooLong = true
+				line = nil
+			} else {
+				line = append(line, frag...)
+			}
+		}
+		if e == bufio.ErrBufferFull {
+			continue
+		}
+		return line, tooLong, e
+	}
 }
 
 // ParseRateLimits turns a rate_limits object into windows plus an optional
