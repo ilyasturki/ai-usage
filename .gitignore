@@ -1,0 +1,6 @@
+# Compiled binary
+/ai-usage
+
+# Nix build output
+/result
+/result-*
