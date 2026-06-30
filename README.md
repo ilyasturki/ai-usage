@@ -25,6 +25,7 @@ reset countdown. Windows with no data are omitted.
 ai-usage          combined Claude + Codex view (default)
 ai-usage claude   Claude usage only
 ai-usage codex    Codex usage only
+ai-usage -v       print the version (also --version)
 ```
 
 Exit status is non-zero when the usage you asked for couldn't be fetched

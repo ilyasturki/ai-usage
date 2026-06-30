@@ -15,13 +15,17 @@ import (
 
 	"ai-usage/internal/app"
 	"ai-usage/internal/provider/claude"
+	"ai-usage/internal/version"
 )
 
 const usageText = `usage: ai-usage [claude|codex]
 
   (no argument)   show combined Claude and Codex usage
   claude          show Claude usage only
-  codex           show Codex usage only`
+  codex           show Codex usage only
+
+  -h, --help      show this help and exit
+  -v, --version   show version and exit`
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -37,6 +41,9 @@ func run(args []string) int {
 			mode = app.ModeCodex
 		case "-h", "--help", "help":
 			fmt.Fprintln(os.Stdout, usageText)
+			return 0
+		case "-v", "--version", "version":
+			fmt.Fprintf(os.Stdout, "ai-usage %s\n", version.Version)
 			return 0
 		default:
 			fmt.Fprintf(os.Stderr, "ai-usage: unknown command %q\n\n%s\n", args[0], usageText)
