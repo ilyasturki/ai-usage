@@ -30,6 +30,15 @@ type Extra struct {
 type Result struct {
 	Windows []Window
 	Extras  []Extra
+	// AsOf is when this data was captured, for a provider that reads a cached
+	// snapshot rather than live state (Codex). Nil means live/now (Claude) or
+	// unknown. The renderer uses it to say how old a Stale result is.
+	AsOf *time.Time
+	// Stale reports that every usage window had already reset by the time it was
+	// read, so the recorded percentages no longer describe a live budget. The
+	// renderer shows a short "no recent session" note in place of the windows —
+	// which, having all reset, would otherwise read as a misleading flat 0%.
+	Stale bool
 }
 
 // Provider is one AI agent's usage source. Adding a third provider (opencode,

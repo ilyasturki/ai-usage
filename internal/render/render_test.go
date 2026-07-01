@@ -136,6 +136,63 @@ func TestLinesOrdersWindowsThenExtras(t *testing.T) {
 	}
 }
 
+func TestLinesStaleShowsNoteInPlaceOfWindows(t *testing.T) {
+	asOf := time.Date(2026, 6, 16, 20, 34, 24, 0, time.UTC)
+	r := usage.Result{
+		Windows: []usage.Window{ // zeroed by the provider; must not be rendered
+			{Label: "5-hour", Utilization: 0},
+			{Label: "Weekly", Utilization: 0},
+		},
+		Extras: []usage.Extra{{Label: "Credits", Value: "0"}},
+		Stale:  true,
+		AsOf:   &asOf,
+	}
+	got := New(false).Lines(r, clock)
+	want := []string{
+		"no recent session — last seen Jun 16 (13 days ago)",
+		"Credits       0",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Lines() = %d lines, want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Lines()[%d]\n got: %q\nwant: %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestLinesStaleWithoutAsOfOmitsAge(t *testing.T) {
+	r := usage.Result{
+		Windows: []usage.Window{{Label: "5-hour", Utilization: 0}},
+		Stale:   true, // AsOf nil: capture time unknown
+	}
+	got := New(false).Lines(r, clock)
+	if len(got) != 1 || got[0] != "no recent session" {
+		t.Errorf("Lines() = %q, want a single bare \"no recent session\" note", got)
+	}
+}
+
+func TestAgo(t *testing.T) {
+	tests := []struct {
+		d    time.Duration
+		want string
+	}{
+		{30 * time.Second, "just now"},
+		{time.Minute, "1 minute ago"},
+		{45 * time.Minute, "45 minutes ago"},
+		{time.Hour, "1 hour ago"},
+		{5 * time.Hour, "5 hours ago"},
+		{24 * time.Hour, "1 day ago"},
+		{13*24*time.Hour + 15*time.Hour, "13 days ago"}, // extra hours floor away
+	}
+	for _, tt := range tests {
+		if got := ago(clock.Add(-tt.d), clock); got != tt.want {
+			t.Errorf("ago(-%s) = %q, want %q", tt.d, got, tt.want)
+		}
+	}
+}
+
 // TestColorStyling checks that an enabled Renderer colors the filled bar by
 // level and dims the empty run and countdown, with matching resets.
 func TestColorStyling(t *testing.T) {

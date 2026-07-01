@@ -177,10 +177,11 @@ func TestCodexOnly(t *testing.T) {
 	}
 }
 
-func TestCodexStaleSnapshotReportsReset(t *testing.T) {
+func TestCodexStaleSnapshotShowsAgeNote(t *testing.T) {
 	// The user's real situation: the newest snapshot is days old and both
-	// windows have since reset. They must read 0% with no countdown, not the
-	// stale 100%/42% recorded at capture time.
+	// windows have since reset. Rather than a confident flat 0% that reads like
+	// fresh "no usage", the section must flag the data as stale and name when it
+	// was last seen. The credit balance (not a window) still shows.
 	stale := fmt.Sprintf(`{"timestamp":"2026-06-16T20:34:24Z","payload":{"type":"token_count","rate_limits":{`+
 		`"primary":{"used_percent":100.0,"resets_at":%d,"window_minutes":300},`+
 		`"secondary":{"used_percent":42.0,"resets_at":%d,"window_minutes":10080},`+
@@ -194,8 +195,7 @@ func TestCodexStaleSnapshotReportsReset(t *testing.T) {
 	code := Run(d, ModeCodex)
 
 	want := join(
-		"5-hour        ░░░░░░░░░░░░░░░░░░░░      0.0%",
-		"Weekly        ░░░░░░░░░░░░░░░░░░░░      0.0%",
+		"no recent session — last seen Jun 16 (13 days ago)",
 		"Credits       0",
 	)
 	if out.String() != want {

@@ -131,7 +131,7 @@ func TestLatestRateLimitsPicksNewestTimestamp(t *testing.T) {
 		`{"timestamp":"2026-06-30T11:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":50.0}}}}`,
 	}, "\n")
 
-	raw, ok := latestRateLimits(strings.NewReader(lines))
+	raw, _, _, ok := latestRateLimits(strings.NewReader(lines))
 	if !ok {
 		t.Fatal("latestRateLimits() ok = false, want a snapshot")
 	}
@@ -155,7 +155,7 @@ func TestLatestRateLimitsSkipsMalformedAndIrrelevantLines(t *testing.T) {
 		``,
 	}, "\n")
 
-	raw, ok := latestRateLimits(strings.NewReader(lines))
+	raw, _, _, ok := latestRateLimits(strings.NewReader(lines))
 	if !ok {
 		t.Fatal("latestRateLimits() ok = false, want the one valid snapshot")
 	}
@@ -170,7 +170,7 @@ func TestLatestRateLimitsLargeLineIsRead(t *testing.T) {
 	padding := strings.Repeat("x", 200*1024)
 	big := fmt.Sprintf(`{"timestamp":"2026-06-30T10:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":77.0}},"junk":%q}}`, padding)
 
-	raw, ok := latestRateLimits(strings.NewReader(big))
+	raw, _, _, ok := latestRateLimits(strings.NewReader(big))
 	if !ok {
 		t.Fatal("latestRateLimits() ok = false on a large valid line")
 	}
@@ -189,7 +189,7 @@ func TestScanRateLimitsOversizedLineSkippedScanContinues(t *testing.T) {
 	oversized := strings.Repeat("x", 512) // exceeds the 256-byte cap below
 	content := older + "\n" + oversized + "\n" + newer + "\n"
 
-	raw, ok := scanRateLimits(strings.NewReader(content), 256)
+	raw, _, _, ok := scanRateLimits(strings.NewReader(content), 256)
 	if !ok {
 		t.Fatal("scanRateLimits() ok = false; the scan aborted at the oversized line")
 	}
@@ -206,7 +206,7 @@ func TestScanRateLimitsOversizedLineBeforeOnlySnapshot(t *testing.T) {
 	snap := `{"timestamp":"2026-06-30T11:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":44.0}}}}`
 	content := oversized + "\n" + snap + "\n"
 
-	raw, ok := scanRateLimits(strings.NewReader(content), 256)
+	raw, _, _, ok := scanRateLimits(strings.NewReader(content), 256)
 	if !ok {
 		t.Fatal("scanRateLimits() ok = false; the oversized first line aborted the scan")
 	}
@@ -217,7 +217,7 @@ func TestScanRateLimitsOversizedLineBeforeOnlySnapshot(t *testing.T) {
 }
 
 func TestLatestRateLimitsNoSnapshot(t *testing.T) {
-	if _, ok := latestRateLimits(strings.NewReader("{}\n{\"payload\":{\"type\":\"x\"}}")); ok {
+	if _, _, _, ok := latestRateLimits(strings.NewReader("{}\n{\"payload\":{\"type\":\"x\"}}")); ok {
 		t.Error("latestRateLimits() ok = true, want false when there is no token_count snapshot")
 	}
 }
@@ -284,6 +284,86 @@ func TestAdjustForResetTreatsResetAtNowAsExpired(t *testing.T) {
 	}
 }
 
+func TestLatestRateLimitsReturnsNewestTimestamp(t *testing.T) {
+	// The returned timestamp must be the winning (newest) snapshot's, not the
+	// first line's, so staleness is measured against the freshest reading.
+	lines := strings.Join([]string{
+		`{"timestamp":"2026-06-30T10:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":10.0}}}}`,
+		`{"timestamp":"2026-06-30T12:00:00Z","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":99.0}}}}`,
+	}, "\n")
+
+	_, at, atOK, ok := latestRateLimits(strings.NewReader(lines))
+	if !ok || !atOK {
+		t.Fatalf("ok=%v atOK=%v, want both true", ok, atOK)
+	}
+	want := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	if !at.Equal(want) {
+		t.Errorf("at = %v, want %v (the newest snapshot's timestamp)", at, want)
+	}
+}
+
+func TestFinalizeFlagsStaleWhenEveryWindowHasReset(t *testing.T) {
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	at := now.Add(-13 * 24 * time.Hour)
+	fiveHour := now.Add(-13 * 24 * time.Hour) // long past
+	weekly := now.Add(-6 * 24 * time.Hour)    // also past
+	r := usage.Result{Windows: []usage.Window{
+		{Label: "5-hour", Utilization: 100, ResetsAt: &fiveHour},
+		{Label: "Weekly", Utilization: 42, ResetsAt: &weekly},
+	}}
+
+	got := finalize(r, at, true, now)
+
+	if !got.Stale {
+		t.Fatal("Stale = false, want true when every window has reset")
+	}
+	if got.AsOf == nil || !got.AsOf.Equal(at) {
+		t.Errorf("AsOf = %v, want the capture time %v", got.AsOf, at)
+	}
+	for _, w := range got.Windows { // adjustForReset still zeroes them
+		if w.Utilization != 0 || w.ResetsAt != nil {
+			t.Errorf("window %q = %+v, want zeroed", w.Label, w)
+		}
+	}
+}
+
+func TestFinalizeNotStaleWhenAWindowIsStillLive(t *testing.T) {
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Hour)
+	future := now.Add(24 * time.Hour)
+	r := usage.Result{Windows: []usage.Window{
+		{Label: "5-hour", Utilization: 100, ResetsAt: &past},  // expired
+		{Label: "Weekly", Utilization: 42, ResetsAt: &future}, // live
+	}}
+
+	got := finalize(r, now.Add(-2*time.Hour), true, now)
+
+	if got.Stale {
+		t.Error("Stale = true, want false while a window is still live")
+	}
+	if got.AsOf != nil {
+		t.Errorf("AsOf = %v, want nil when not stale", got.AsOf)
+	}
+	if got.Windows[1].Utilization != 42 || got.Windows[1].ResetsAt == nil {
+		t.Errorf("live window = %+v, want its 42%% and countdown kept", got.Windows[1])
+	}
+}
+
+func TestFinalizeStaleWithoutTimestampOmitsAsOf(t *testing.T) {
+	now := time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Hour)
+	r := usage.Result{Windows: []usage.Window{{Label: "5-hour", Utilization: 100, ResetsAt: &past}}}
+
+	got := finalize(r, time.Time{}, false, now)
+
+	if !got.Stale {
+		t.Fatal("Stale = false, want true even without a timestamp")
+	}
+	if got.AsOf != nil {
+		t.Errorf("AsOf = %v, want nil when the capture time is unknown", got.AsOf)
+	}
+}
+
 func TestSnapshotFromFilePrefersTail(t *testing.T) {
 	// The newest snapshot sits near EOF; scanning only a small tail window must
 	// still find it (and prefer it over an older snapshot before the window).
@@ -297,7 +377,7 @@ func TestSnapshotFromFilePrefersTail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	raw, ok := snapshotFromFile(path, 256)
+	raw, _, _, ok := snapshotFromFile(path, 256)
 	if !ok {
 		t.Fatal("snapshotFromFile() ok = false, want the tail snapshot")
 	}
@@ -319,7 +399,7 @@ func TestSnapshotFromFileFallsBackWhenTailHasNoSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	raw, ok := snapshotFromFile(path, 256)
+	raw, _, _, ok := snapshotFromFile(path, 256)
 	if !ok {
 		t.Fatal("snapshotFromFile() ok = false; full-scan fallback did not run")
 	}

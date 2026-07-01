@@ -57,16 +57,35 @@ func (rr Renderer) Header(name string) string {
 }
 
 // Lines renders a result's windows then extras, without indentation or trailing
-// newlines. now drives the reset countdowns.
+// newlines. now drives the reset countdowns. A stale result — every window
+// already reset by now — shows a single "no recent session" note in place of
+// its windows, since they would otherwise read as a misleading flat 0%.
 func (rr Renderer) Lines(r usage.Result, now time.Time) []string {
-	lines := make([]string, 0, len(r.Windows)+len(r.Extras))
-	for _, w := range r.Windows {
-		lines = append(lines, rr.Window(w, now))
+	lines := make([]string, 0, len(r.Windows)+len(r.Extras)+1)
+	if r.Stale {
+		lines = append(lines, rr.staleNote(r.AsOf, now))
+	} else {
+		for _, w := range r.Windows {
+			lines = append(lines, rr.Window(w, now))
+		}
 	}
 	for _, e := range r.Extras {
 		lines = append(lines, rr.Extra(e))
 	}
 	return lines
+}
+
+// staleNote is shown in place of windows when a provider's data is stale: every
+// window has reset since it was captured, so the recorded percentages no longer
+// describe a live budget. It names how long ago the data was captured when that
+// time is known, so an old reading is never mistaken for fresh 0% use. The date
+// is shown in now's location so it reads in the user's own clock.
+func (rr Renderer) staleNote(asOf *time.Time, now time.Time) string {
+	if asOf == nil {
+		return rr.dim("no recent session")
+	}
+	when := asOf.In(now.Location()).Format("Jan 2")
+	return rr.dim(fmt.Sprintf("no recent session — last seen %s (%s)", when, ago(*asOf, now)))
 }
 
 // Window formats one window as "{label}{bar}    {percent}{   countdown}".
@@ -126,6 +145,23 @@ func countdown(resetsAt, now time.Time) string {
 		return "resets in " + primary + " " + secondary
 	}
 	return "resets in " + primary
+}
+
+// ago renders how long before now a past time was, as "<n> <unit> ago" using
+// the single largest whole unit (days, then hours, then minutes). It floors like
+// countdown, so a moment just past reads "just now" rather than a zero count.
+func ago(t, now time.Time) string {
+	mins := int(math.Floor(now.Sub(t).Minutes()))
+	switch {
+	case mins < 1:
+		return "just now"
+	case mins < 60:
+		return plural(mins, "minute") + " ago"
+	case mins < 1440:
+		return plural(mins/60, "hour") + " ago"
+	default:
+		return plural(mins/1440, "day") + " ago"
+	}
 }
 
 // plural formats a count and its unit as "1 day" / "3 days", returning "" for a

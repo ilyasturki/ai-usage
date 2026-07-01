@@ -69,7 +69,7 @@ func (p *Provider) Fetch() (usage.Result, error) {
 	}
 
 	for _, path := range paths {
-		raw, ok := snapshotFromFile(path, tailWindowBytes)
+		raw, at, atOK, ok := snapshotFromFile(path, tailWindowBytes)
 		if !ok {
 			continue
 		}
@@ -77,35 +77,36 @@ func (p *Provider) Fetch() (usage.Result, error) {
 		if err != nil {
 			return usage.Result{}, err
 		}
-		return adjustForReset(res, p.now()), nil
+		return finalize(res, at, atOK, p.now()), nil
 	}
 	return usage.Result{}, ErrNoSnapshot
 }
 
-// snapshotFromFile returns the latest rate-limit snapshot in one session file.
-// It scans only the final tailWindow bytes first — the newest snapshot sits
-// near the end of an append-only log — and falls back to a full scan when that
-// tail holds no snapshot. Seeking mid-file lands inside a line whose truncated
-// JSON simply fails to parse and is skipped, so the partial first line is
-// harmless. tailWindow is a parameter so tests drive both paths cheaply.
-func snapshotFromFile(path string, tailWindow int64) (json.RawMessage, bool) {
+// snapshotFromFile returns the latest rate-limit snapshot in one session file
+// along with its event timestamp (at, valid only when atOK). It scans only the
+// final tailWindow bytes first — the newest snapshot sits near the end of an
+// append-only log — and falls back to a full scan when that tail holds no
+// snapshot. Seeking mid-file lands inside a line whose truncated JSON simply
+// fails to parse and is skipped, so the partial first line is harmless.
+// tailWindow is a parameter so tests drive both paths cheaply.
+func snapshotFromFile(path string, tailWindow int64) (raw json.RawMessage, at time.Time, atOK, ok bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, false
+		return nil, time.Time{}, false, false
 	}
 	defer f.Close()
 
 	// Fast path: the newest snapshot sits near EOF, so scan only the tail.
 	if info, err := f.Stat(); err == nil && info.Size() > tailWindow {
 		if _, err := f.Seek(info.Size()-tailWindow, io.SeekStart); err == nil {
-			if raw, ok := latestRateLimits(f); ok {
-				return raw, true
+			if raw, at, atOK, ok := latestRateLimits(f); ok {
+				return raw, at, atOK, true
 			}
 		}
 	}
 	// Fallback: rewind and scan the whole file.
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, false
+		return nil, time.Time{}, false, false
 	}
 	return latestRateLimits(f)
 }
@@ -150,17 +151,18 @@ func jsonlFilesByMtimeDesc(root string) ([]string, error) {
 }
 
 // latestRateLimits scans one session file and returns the rate_limits object
-// from the token_count event with the latest timestamp. Lines are read at any
-// length up to maxLineBytes; malformed lines and lines beyond that cap are both
-// skipped while the scan continues, so one bad line never aborts the file or
-// discards snapshots found before or after it.
-func latestRateLimits(r io.Reader) (json.RawMessage, bool) {
+// from the token_count event with the latest timestamp, plus that timestamp (at,
+// valid only when atOK). Lines are read at any length up to maxLineBytes;
+// malformed lines and lines beyond that cap are both skipped while the scan
+// continues, so one bad line never aborts the file or discards snapshots found
+// before or after it.
+func latestRateLimits(r io.Reader) (raw json.RawMessage, at time.Time, atOK, ok bool) {
 	return scanRateLimits(r, maxLineBytes)
 }
 
 // scanRateLimits is latestRateLimits with an injectable line cap so the
 // oversized-line path can be exercised in tests without a multi-megabyte fixture.
-func scanRateLimits(r io.Reader, maxLine int) (json.RawMessage, bool) {
+func scanRateLimits(r io.Reader, maxLine int) (raw json.RawMessage, at time.Time, atOK, ok bool) {
 	br := bufio.NewReaderSize(r, 64*1024)
 
 	var current json.RawMessage
@@ -170,13 +172,13 @@ func scanRateLimits(r io.Reader, maxLine int) (json.RawMessage, bool) {
 	for {
 		line, tooLong, err := readLine(br, maxLine)
 		if len(line) > 0 && !tooLong {
-			if rl, at, atOK, ok := parseEventLine(line); ok {
+			if rl, evAt, evAtOK, ok := parseEventLine(line); ok {
 				// Take the first snapshot unconditionally, then replace only
 				// with a strictly newer, parseable timestamp.
-				if !haveCurrent || (atOK && (!haveCurrentAt || at.After(currentAt))) {
+				if !haveCurrent || (evAtOK && (!haveCurrentAt || evAt.After(currentAt))) {
 					current = rl
 					haveCurrent = true
-					currentAt, haveCurrentAt = at, atOK
+					currentAt, haveCurrentAt = evAt, evAtOK
 				}
 			}
 		}
@@ -184,7 +186,7 @@ func scanRateLimits(r io.Reader, maxLine int) (json.RawMessage, bool) {
 			break
 		}
 	}
-	return current, haveCurrent
+	return current, currentAt, haveCurrentAt, haveCurrent
 }
 
 // parseEventLine extracts the rate_limits object and event timestamp from one
@@ -255,6 +257,38 @@ func ParseRateLimits(raw json.RawMessage) (usage.Result, error) {
 		extras = append(extras, e)
 	}
 	return usage.Result{Windows: windows, Extras: extras}, nil
+}
+
+// finalize turns a freshly parsed snapshot into what the renderer shows: it
+// adjusts each window for elapsed resets and, when the snapshot no longer
+// describes any live window (every window has reset since capture), flags the
+// whole result stale and records when it was captured. A stale result's windows
+// are all zeroed by adjustForReset, so without this flag they would render as a
+// confident flat 0% — indistinguishable from a fresh reading of genuine zero
+// use. at is carried only when atOK; a stale snapshot with an unknown timestamp
+// is still flagged, just without an age.
+func finalize(r usage.Result, at time.Time, atOK bool, now time.Time) usage.Result {
+	stale := len(r.Windows) > 0 && allResetsPast(r.Windows, now)
+	r = adjustForReset(r, now)
+	if stale {
+		r.Stale = true
+		if atOK {
+			r.AsOf = &at
+		}
+	}
+	return r
+}
+
+// allResetsPast reports whether every window has a known reset that is at or
+// before now. A window with no known reset (nil) counts as not-past, so a
+// snapshot still carrying any live or countdown-less window is never stale.
+func allResetsPast(ws []usage.Window, now time.Time) bool {
+	for i := range ws {
+		if rs := ws[i].ResetsAt; rs == nil || rs.After(now) {
+			return false
+		}
+	}
+	return true
 }
 
 // adjustForReset corrects for the snapshot being a point-in-time record. A
