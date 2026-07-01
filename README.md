@@ -1,74 +1,24 @@
 # ai-usage
 
-Check your Claude and Codex subscription usage from the terminal — one command,
-no new session, no `curl | jq | python3` pipeline.
+Claude and Codex subscription usage in the terminal. One command, no new
+session, no `curl | jq | python3` pipeline.
+
+![ai-usage example output](docs/usage.png)
+
+Each window is a 20-character bar (one block per 5%) with its utilization and the
+time until it resets. On a terminal the bar is colored by how full it is (green,
+then yellow, then red), and falls back to plain text when piped or under
+`NO_COLOR`. Windows with no data are dropped.
+
+## Install
+
+Run it without installing:
 
 ```
-$ ai-usage
-━━━ Claude ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  5-hour        ██░░░░░░░░░░░░░░░░░░     14.0%   resets in 1 hour 48 minutes
-  Weekly        █████████░░░░░░░░░░░     49.0%   resets in 1 hour 58 minutes
-  Weekly Sonnet ░░░░░░░░░░░░░░░░░░░░      0.0%
-
-━━━ Codex ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  5-hour        ████████████████████    100.0%   resets now
-  Weekly        ████████░░░░░░░░░░░░     42.0%   resets now
-  Credits       unlimited
+nix run github:ilyasturki/ai-usage
 ```
 
-Each window is a 20-character bar (one block per 5%) showing utilization and the
-time until it resets. When writing to a
-terminal the bars are color-coded by how full they are — green, then yellow,
-then red — and dropped to plain text when piped or under `NO_COLOR`. Windows
-with no data are omitted.
-
-## Usage
-
-```
-ai-usage          combined Claude + Codex view (default)
-ai-usage claude   Claude usage only
-ai-usage codex    Codex usage only
-ai-usage -v       print the version (also --version)
-```
-
-Exit status is non-zero when the usage you asked for couldn't be fetched
-(combined mode is non-zero only when *both* providers fail), so it scripts
-cleanly.
-
-## How it reads usage
-
-- **Claude** reuses the OAuth token Claude Code stores in
-  `~/.claude/.credentials.json` and calls the same `oauth/usage` endpoint the
-  `/usage` command hits. It never refreshes the token: when it's stale (401)
-  you get a clear "open Claude once to refresh" message.
-- **Codex** reads the rate-limit snapshots Codex already writes to its session
-  logs under `~/.codex/sessions` (honoring `$CODEX_HOME`), newest file first —
-  so checking usage doesn't start a session of its own. Only the tail of each
-  log is read (the latest snapshot lives at the end), so it stays fast even when
-  sessions grow to hundreds of MB. Because the snapshot is a point in time, a
-  window whose reset has already passed reads `0.0%`: it rolled over since the
-  snapshot, and no newer usage means no newer snapshot — so a Codex you haven't
-  touched in days shows empty windows rather than a stale percentage.
-
-Both upstreams are undocumented and have shifted between releases; this tool
-trades clear errors and a fast test loop for that, not immunity.
-
-## Build
-
-```
-go build -o ai-usage .   # standard library only
-go test ./...
-```
-
-### Nix
-
-```
-nix build              # ./result/bin/ai-usage
-nix run . -- claude
-```
-
-Packaged with `buildGoModule` (`vendorHash = null`). Consume it as a flake
-input the way the rest of the config consumes its tools:
+Add it to a Nix config:
 
 ```nix
 inputs.ai-usage.url = "github:ilyasturki/ai-usage";
@@ -76,13 +26,39 @@ inputs.ai-usage.url = "github:ilyasturki/ai-usage";
 home.packages = [ inputs.ai-usage.packages.${system}.default ];
 ```
 
-## Adding a provider
+Or build from source. Standard library only, nothing to vendor:
 
-A provider yields usage windows (label, utilization, optional reset) plus
-optional extra lines, behind one interface in
-[`internal/usage`](internal/usage/usage.go). Its raw-response → windows parsing
-is a pure, separately-tested function. A third agent (opencode, antigravity, …)
-is a new file under `internal/provider/`, not a rewrite.
+```
+go build -o ai-usage .
+```
+
+## Usage
+
+```
+ai-usage          combined Claude + Codex view (default)
+ai-usage claude   Claude usage only
+ai-usage codex    Codex usage only
+```
+
+Exit status is non-zero when the usage you asked for couldn't be fetched. In
+combined mode that means both providers failed, so it scripts cleanly.
+
+## How it reads usage
+
+- **Claude** reuses the OAuth token Claude Code stores in
+  `~/.claude/.credentials.json` and calls the same `oauth/usage` endpoint the
+  `/usage` command hits. It never refreshes the token. When it's stale (401) you
+  get a clear "open Claude once to refresh" message.
+- **Codex** reads the rate-limit snapshots Codex already writes to its session
+  logs under `~/.codex/sessions` (honoring `$CODEX_HOME`), newest file first, so
+  checking usage doesn't start a session of its own. Only the tail of each log is
+  scanned, so it stays fast even when sessions grow to hundreds of MB. The
+  snapshot is a point in time: a window whose reset already passed reads `0.0%`
+  (it rolled over, and no newer usage means no newer snapshot), so an idle Codex
+  shows empty windows instead of a stale percentage.
+
+Both upstreams are undocumented and shift between releases. This tool trades
+clear errors and a fast test loop for that, not immunity.
 
 ## License
 
