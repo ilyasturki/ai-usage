@@ -62,10 +62,15 @@ func run(args []string) int {
 		codexHome = filepath.Join(home, ".codex")
 	}
 
+	claudeConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	if claudeConfigDir == "" {
+		claudeConfigDir = filepath.Join(home, ".claude")
+	}
+
 	deps := app.Deps{
 		HTTPClient:  &http.Client{Timeout: 15 * time.Second},
 		BaseURL:     claude.DefaultBaseURL,
-		CredsPath:   filepath.Join(home, ".claude", ".credentials.json"),
+		CredsPath:   filepath.Join(claudeConfigDir, ".credentials.json"),
 		SessionsDir: filepath.Join(codexHome, "sessions"),
 		Now:         time.Now,
 		Out:         os.Stdout,
