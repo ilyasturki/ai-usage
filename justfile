@@ -26,3 +26,28 @@ nix-build:
 # Run via Nix, passing args through (e.g. `just nix-run claude`)
 nix-run *ARGS:
     nix run . -- {{ARGS}}
+
+# Bump the VERSION file, then commit and annotate-tag (e.g. `just bump patch`).
+# PART is major, minor, or patch. Requires a clean working tree.
+bump PART:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{PART}}" in
+      major|minor|patch) ;;
+      *) echo "usage: just bump major|minor|patch" >&2; exit 1 ;;
+    esac
+    if [ -n "$(git status --porcelain)" ]; then
+      echo "working tree not clean; commit or stash first" >&2
+      exit 1
+    fi
+    IFS=. read -r major minor patch < VERSION
+    case "{{PART}}" in
+      major) major=$((major + 1)); minor=0; patch=0 ;;
+      minor) minor=$((minor + 1)); patch=0 ;;
+      patch) patch=$((patch + 1)) ;;
+    esac
+    new="${major}.${minor}.${patch}"
+    echo "{{version}} -> ${new}"
+    printf '%s\n' "${new}" > VERSION
+    git commit -am "chore: bump version to ${new}"
+    git tag -a "v${new}" -m "v${new}"
