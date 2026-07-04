@@ -50,6 +50,87 @@ func TestParseUsageHealthy(t *testing.T) {
 	}
 }
 
+func TestParseUsageScopedWeeklyLimit(t *testing.T) {
+	// Real-account shape: the per-model weekly limits (Fable here) live only in
+	// the "limits" array as weekly_scoped entries, while seven_day_opus/sonnet
+	// are null. The session/weekly_all entries duplicate the top-level windows
+	// and must not add extra lines.
+	body := []byte(`{
+		"five_hour":        {"utilization": 43.0, "resets_at": "2026-07-04T23:00:00.353045+00:00"},
+		"seven_day":        {"utilization": 58.0, "resets_at": "2026-07-07T15:00:00.353062+00:00"},
+		"seven_day_opus":   null,
+		"seven_day_sonnet": null,
+		"limits": [
+			{"kind": "session",       "group": "session", "percent": 43, "resets_at": "2026-07-04T23:00:00.353045+00:00", "scope": null},
+			{"kind": "weekly_all",    "group": "weekly",  "percent": 58, "resets_at": "2026-07-07T15:00:00.353062+00:00", "scope": null},
+			{"kind": "weekly_scoped", "group": "weekly",  "percent": 76, "resets_at": "2026-07-07T15:00:00.353320+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}}, "is_active": true}
+		]
+	}`)
+
+	res, err := ParseUsage(body)
+	if err != nil {
+		t.Fatalf("ParseUsage() error = %v", err)
+	}
+	// five_hour, seven_day, then the Fable window pulled from the limits array.
+	if len(res.Windows) != 3 {
+		t.Fatalf("got %d windows, want 3: %+v", len(res.Windows), res.Windows)
+	}
+	fable := res.Windows[2]
+	if fable.Label != "Weekly Fable" || fable.Utilization != 76 {
+		t.Errorf("scoped window = {%q, %v}, want {%q, 76}", fable.Label, fable.Utilization, "Weekly Fable")
+	}
+	if fable.ResetsAt == nil {
+		t.Fatal("Weekly Fable ResetsAt is nil, want a parsed time")
+	}
+	wantReset, _ := time.Parse(time.RFC3339, "2026-07-07T15:00:00.353320+00:00")
+	if !fable.ResetsAt.Equal(wantReset) {
+		t.Errorf("Weekly Fable ResetsAt = %v, want %v", fable.ResetsAt, wantReset)
+	}
+}
+
+func TestParseUsageScopedLimitDedupesTopLevelWindow(t *testing.T) {
+	// A model reported both as a top-level window and as a weekly_scoped limit
+	// must render exactly once (the top-level window wins).
+	body := []byte(`{
+		"five_hour":      {"utilization": 5.0},
+		"seven_day_opus": {"utilization": 30.0},
+		"limits": [
+			{"kind": "weekly_scoped", "percent": 30, "scope": {"model": {"display_name": "Opus"}}}
+		]
+	}`)
+	res, err := ParseUsage(body)
+	if err != nil {
+		t.Fatalf("ParseUsage() error = %v", err)
+	}
+	opus := 0
+	for _, w := range res.Windows {
+		if w.Label == "Weekly Opus" {
+			opus++
+		}
+	}
+	if opus != 1 {
+		t.Fatalf("got %d Weekly Opus windows, want 1: %+v", opus, res.Windows)
+	}
+}
+
+func TestParseUsageIgnoresNonScopedAndMalformedLimits(t *testing.T) {
+	// weekly_scoped without a model, non-weekly_scoped kinds, and a non-array
+	// limits value must all be tolerated without adding windows or erroring.
+	for name, body := range map[string]string{
+		"scoped without model": `{"five_hour": {"utilization": 5.0}, "limits": [{"kind": "weekly_scoped", "percent": 50, "scope": null}]}`,
+		"only session/weekly":  `{"five_hour": {"utilization": 5.0}, "limits": [{"kind": "session", "percent": 5}, {"kind": "weekly_all", "percent": 9}]}`,
+		"limits not an array":  `{"five_hour": {"utilization": 5.0}, "limits": {"unexpected": "object"}}`,
+	} {
+		res, err := ParseUsage([]byte(body))
+		if err != nil {
+			t.Fatalf("%s: ParseUsage() error = %v", name, err)
+		}
+		if len(res.Windows) != 1 || res.Windows[0].Label != "5-hour" {
+			t.Fatalf("%s: got %+v, want only the 5-hour window", name, res.Windows)
+		}
+	}
+}
+
 func TestParseUsageMissingFiveHourIsExpired(t *testing.T) {
 	// A 401-style error body lacks five_hour entirely.
 	body := []byte(`{"error": {"type": "authentication_error", "message": "expired"}}`)
