@@ -1,7 +1,18 @@
-// Package codex reads Codex usage from the rate-limit snapshots Codex records
-// in its session logs, so checking usage never starts a new Codex session. It
-// walks ~/.codex/sessions newest-file-first and reports the most recent
-// snapshot it finds.
+// Package codex reads Codex usage without ever starting a Codex session.
+//
+// It prefers live numbers: `codex app-server` answers account/rateLimits/read
+// with the account's current limits, the same call Codex's own UI makes, which
+// spends no model quota. When that is unavailable — codex not installed, no
+// network, a protocol that has moved on — it falls back to the rate-limit
+// snapshots Codex writes into its session logs, walking ~/.codex/sessions
+// newest-file-first for the most recent one.
+//
+// The two sources are not equivalent, and the fallback is the weaker of them: a
+// snapshot only describes the moment it was written, and Codex re-anchors its
+// weekly window rather than holding the reset it recorded, so an old snapshot
+// can claim usage the account no longer has. finalize therefore ages the
+// fallback and the renderer presents it as a ceiling. The live path needs none
+// of that.
 package codex
 
 import (
@@ -34,15 +45,28 @@ const maxLineBytes = 16 * 1024 * 1024
 // newest one was the whole reason `codex` took seconds to print.
 const tailWindowBytes = 4 * 1024 * 1024
 
+// snapshotMaxAge is how old a snapshot may be before its age is surfaced next
+// to the windows it produced. A snapshot only describes current usage while
+// nothing has been spent since it was written, and the session logs are not a
+// complete record of that: usage from another machine, the Codex web app, or an
+// editor extension never reaches this directory at all. Codex's short window is
+// 5 hours, so beyond that an entire window could have come and gone unobserved.
+// Below this the reading is treated as current and shown bare.
+const snapshotMaxAge = 6 * time.Hour
+
 // ErrNoSnapshot is returned when no session file yields a rate-limit snapshot.
 var ErrNoSnapshot = errors.New("codex-usage: no Codex rate-limit snapshot found")
 
-// Provider scans the Codex sessions directory for the latest rate-limit
-// snapshot. SessionsDir is injected so tests can point at a fixture tree, and
-// Now is injected so staleness correction is deterministic under test.
+// Provider reports Codex usage, live when it can and from the session logs
+// when it cannot. SessionsDir is injected so tests can point at a fixture tree,
+// Now so staleness correction is deterministic, and Live so the app-server
+// exchange can be faked without spawning a subprocess.
 type Provider struct {
 	SessionsDir string
 	Now         func() time.Time // current time for staleness; nil means time.Now
+	// Live returns the raw account/rateLimits/read result. nil means spawn a
+	// real `codex app-server`.
+	Live func() (json.RawMessage, error)
 }
 
 // Name is the combined-view header for this provider.
@@ -55,9 +79,43 @@ func (p *Provider) now() time.Time {
 	return time.Now()
 }
 
-// Fetch finds the newest session file (by mtime) that carries a rate-limit
-// snapshot and renders it. The first file yielding a snapshot wins.
+// Fetch reports the account's usage, preferring the live app-server reading and
+// falling back to the newest session-log snapshot when it cannot be had. A live
+// failure is not surfaced: it is the ordinary case offline or without codex
+// installed, and the fallback still has something worth showing. Only when both
+// sources fail does an error reach the caller, and it is the session-log error,
+// which names a path the user can check.
 func (p *Provider) Fetch() (usage.Result, error) {
+	if res, err := p.fetchLive(); err == nil {
+		return res, nil
+	}
+	return p.fetchFromSessions()
+}
+
+// fetchLive reads the account's current limits from the app-server. Live
+// numbers need no staleness correction — nothing about them is remembered.
+func (p *Provider) fetchLive() (usage.Result, error) {
+	read := p.Live
+	if read == nil {
+		read = liveRateLimits
+	}
+	raw, err := read()
+	if err != nil {
+		return usage.Result{}, err
+	}
+	res, err := ParseLiveRateLimits(raw)
+	if err != nil {
+		return usage.Result{}, err
+	}
+	if len(res.Windows) == 0 {
+		return usage.Result{}, ErrNoSnapshot
+	}
+	return res, nil
+}
+
+// fetchFromSessions finds the newest session file (by mtime) that carries a
+// rate-limit snapshot and renders it. The first file yielding a snapshot wins.
+func (p *Provider) fetchFromSessions() (usage.Result, error) {
 	info, err := os.Stat(p.SessionsDir)
 	if err != nil || !info.IsDir() {
 		return usage.Result{}, fmt.Errorf("codex-usage: %s not found", p.SessionsDir)
@@ -260,21 +318,30 @@ func ParseRateLimits(raw json.RawMessage) (usage.Result, error) {
 }
 
 // finalize turns a freshly parsed snapshot into what the renderer shows: it
-// adjusts each window for elapsed resets and, when the snapshot no longer
-// describes any live window (every window has reset since capture), flags the
-// whole result stale and records when it was captured. A stale result's windows
-// are all zeroed by adjustForReset, so without this flag they would render as a
-// confident flat 0% — indistinguishable from a fresh reading of genuine zero
-// use. at is carried only when atOK; a stale snapshot with an unknown timestamp
+// adjusts each window for elapsed resets, flags the result stale when the
+// snapshot no longer describes any live window, and records the capture time
+// whenever that age is material.
+//
+// The two conditions are separate on purpose. A stale result — every window has
+// reset since capture — has all its windows zeroed by adjustForReset, so without
+// the flag it would render as a confident flat 0%, indistinguishable from a
+// fresh reading of genuine zero use. But a result can also be plainly out of
+// date while a window is still live: a lone weekly window keeps a future reset
+// for up to seven days, so an old snapshot would otherwise render exactly like a
+// current one, countdown and all. Age is therefore carried past snapshotMaxAge
+// too, so the renderer can show the percentages with their age attached instead
+// of implying they were read just now.
+//
+// at is carried only when atOK; a stale snapshot whose timestamp did not parse
 // is still flagged, just without an age.
 func finalize(r usage.Result, at time.Time, atOK bool, now time.Time) usage.Result {
 	stale := len(r.Windows) > 0 && allResetsPast(r.Windows, now)
 	r = adjustForReset(r, now)
 	if stale {
 		r.Stale = true
-		if atOK {
-			r.AsOf = &at
-		}
+	}
+	if atOK && (stale || now.Sub(at) >= snapshotMaxAge) {
+		r.AsOf = &at
 	}
 	return r
 }
@@ -295,10 +362,18 @@ func allResetsPast(ws []usage.Window, now time.Time) bool {
 // window whose reset has already passed (relative to now) has rolled over to a
 // fresh window since the snapshot was written; because any newer usage would
 // have produced a newer snapshot, that window is now empty — reported as 0%
-// with no pending countdown. Windows not yet reset keep their recorded
-// utilization, since usage only accumulates within a window. This is why a
-// 5-hour window last seen at 100% reads 0% once its reset has passed, rather
-// than showing a stale 100% with a "resets now" countdown.
+// with no pending countdown. This is why a 5-hour window last seen at 100%
+// reads 0% once its reset has passed, rather than showing a stale 100% with a
+// "resets now" countdown.
+//
+// A window that has not reset keeps its recorded utilization, but that figure
+// is only an upper bound, not a current reading: Codex's weekly limit is a
+// rolling window whose usage ages out continuously rather than a bucket held
+// until resets_at. Observed directly in the session logs — the weekly fell from
+// 26% (Jul 11) to 15% (Jul 15) with its recorded reset of Jul 18 still ahead —
+// and its anchor slides too, having moved Jul 16 → Jul 18 → Jul 22 across
+// consecutive snapshots. finalize therefore marks anything past snapshotMaxAge
+// with an AsOf so the renderer can present it as a ceiling.
 func adjustForReset(r usage.Result, now time.Time) usage.Result {
 	for i := range r.Windows {
 		w := &r.Windows[i]

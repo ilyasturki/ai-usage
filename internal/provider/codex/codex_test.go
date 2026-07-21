@@ -342,10 +342,44 @@ func TestFinalizeNotStaleWhenAWindowIsStillLive(t *testing.T) {
 		t.Error("Stale = true, want false while a window is still live")
 	}
 	if got.AsOf != nil {
-		t.Errorf("AsOf = %v, want nil when not stale", got.AsOf)
+		t.Errorf("AsOf = %v, want nil for a snapshot younger than snapshotMaxAge", got.AsOf)
 	}
 	if got.Windows[1].Utilization != 42 || got.Windows[1].ResetsAt == nil {
 		t.Errorf("live window = %+v, want its 42%% and countdown kept", got.Windows[1])
+	}
+}
+
+// Codex 0.144 reports a single weekly window: the weekly limit moved from
+// "secondary" to "primary" and "secondary" is now null. One window with a
+// seven-day reset can stay live long after the last session, so the all-windows-
+// reset test for staleness never fires and a days-old reading would otherwise
+// render exactly like a fresh one — right down to the countdown. Age must be
+// carried so the renderer can date it. The payload below is one Codex wrote.
+func TestFinalizeCarriesAgeForOldButLiveWeeklyWindow(t *testing.T) {
+	const snap = `{"limit_id":"codex","limit_name":null,` +
+		`"primary":{"used_percent":18.0,"window_minutes":10080,"resets_at":1784713573},` +
+		`"secondary":null,"credits":null,"individual_limit":null,"plan_type":"plus"}`
+
+	r, err := ParseRateLimits([]byte(snap))
+	if err != nil {
+		t.Fatalf("ParseRateLimits: %v", err)
+	}
+	at := time.Date(2026, 7, 15, 23, 33, 20, 0, time.UTC)
+	now := time.Date(2026, 7, 21, 11, 31, 0, 0, time.UTC) // 5.5 days later
+
+	got := finalize(r, at, true, now)
+
+	if got.Stale {
+		t.Error("Stale = true, want false: the weekly window has not reset yet")
+	}
+	if got.AsOf == nil || !got.AsOf.Equal(at) {
+		t.Fatalf("AsOf = %v, want the capture time %v so the age can be shown", got.AsOf, at)
+	}
+	if len(got.Windows) != 1 {
+		t.Fatalf("got %d windows, want 1 (weekly only)", len(got.Windows))
+	}
+	if w := got.Windows[0]; w.Label != "Weekly" || w.Utilization != 18 || w.ResetsAt == nil {
+		t.Errorf("window = %+v, want the recorded Weekly 18%% and its countdown kept", w)
 	}
 }
 

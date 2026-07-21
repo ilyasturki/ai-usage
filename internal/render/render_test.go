@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"ai-usage/internal/usage"
 )
@@ -158,6 +159,48 @@ func TestLinesStaleShowsNoteInPlaceOfWindows(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("Lines()[%d]\n got: %q\nwant: %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestLinesOldSnapshotRendersWindowsAsUpperBounds(t *testing.T) {
+	// Not stale — the window has not reset — but read from a snapshot days old.
+	// Codex's weekly decays as usage ages out, so the recorded figure is a
+	// ceiling: it keeps its "≤" and loses the countdown, whose recorded reset
+	// time the provider slides forward anyway.
+	asOf := time.Date(2026, 6, 16, 20, 34, 24, 0, time.UTC)
+	resets := clock.Add(22 * time.Hour)
+	r := usage.Result{
+		Windows: []usage.Window{{Label: "Weekly", Utilization: 18, ResetsAt: &resets}},
+		AsOf:    &asOf,
+	}
+	got := New(false).Lines(r, clock)
+	want := []string{
+		"Weekly        ███░░░░░░░░░░░░░░░░░    ≤18.0%",
+		"as of Jun 16 (13 days ago) — actual is lower",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Lines() = %d lines, want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Lines()[%d]\n got: %q\nwant: %q", i, got[i], want[i])
+		}
+	}
+}
+
+// The "≤" is three bytes but one column, so padding the percentage by byte
+// length would pull a bounded line two columns short of a plain one. Both must
+// occupy the same display width.
+func TestUpperBoundPercentKeepsColumnAlignment(t *testing.T) {
+	rr := New(false)
+	for _, util := range []float64{0, 2.5, 18, 100} {
+		w := usage.Window{Label: "Weekly", Utilization: util}
+		plain := utf8.RuneCountInString(rr.window(w, clock, false))
+		bounded := utf8.RuneCountInString(rr.window(w, clock, true))
+		if plain != bounded {
+			t.Errorf("at %.1f%%: plain line is %d columns, bounded is %d; want equal\n plain: %q\n bound: %q",
+				util, plain, bounded, rr.window(w, clock, false), rr.window(w, clock, true))
 		}
 	}
 }

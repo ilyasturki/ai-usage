@@ -24,6 +24,10 @@ const (
 	// labelWidth left-pads every label so the bars (and an extra's value) line
 	// up. It is wide enough that the longest label, "Weekly Sonnet", keeps a gap.
 	labelWidth = 14
+	// pctWidth is the column the percentage is right-aligned in: wide enough for
+	// "100.0%" with the gap that follows a bar, and for the "≤" an upper bound
+	// carries without shifting the numbers out of line.
+	pctWidth = 10
 	// ruleWidth is the total column width of a provider's section-header rule.
 	ruleWidth = 50
 )
@@ -59,14 +63,21 @@ func (rr Renderer) Header(name string) string {
 // Lines renders a result's windows then extras, without indentation or trailing
 // newlines. now drives the reset countdowns. A stale result — every window
 // already reset by now — shows a single "no recent session" note in place of
-// its windows, since they would otherwise read as a misleading flat 0%.
+// its windows, since they would otherwise read as a misleading flat 0%. Windows
+// from a snapshot old enough to matter (AsOf set) render as upper bounds — a
+// recorded percentage only decays as usage ages out — followed by an "as of"
+// line naming the age.
 func (rr Renderer) Lines(r usage.Result, now time.Time) []string {
 	lines := make([]string, 0, len(r.Windows)+len(r.Extras)+1)
 	if r.Stale {
 		lines = append(lines, rr.staleNote(r.AsOf, now))
 	} else {
+		bounded := r.AsOf != nil
 		for _, w := range r.Windows {
-			lines = append(lines, rr.Window(w, now))
+			lines = append(lines, rr.window(w, now, bounded))
+		}
+		if bounded && len(r.Windows) > 0 {
+			lines = append(lines, rr.ageNote(*r.AsOf, now))
 		}
 	}
 	for _, e := range r.Extras {
@@ -88,13 +99,49 @@ func (rr Renderer) staleNote(asOf *time.Time, now time.Time) string {
 	return rr.dim(fmt.Sprintf("no recent session — last seen %s (%s)", when, ago(*asOf, now)))
 }
 
+// ageNote dates windows rendered as upper bounds, naming both when the reading
+// was taken and which way it is wrong, so a ceiling is not read as a measurement.
+// The date is shown in now's location so it reads in the user's own clock.
+func (rr Renderer) ageNote(asOf, now time.Time) string {
+	when := asOf.In(now.Location()).Format("Jan 2")
+	return rr.dim(fmt.Sprintf("as of %s (%s) — actual is lower", when, ago(asOf, now)))
+}
+
 // Window formats one window as "{label}{bar}    {percent}{   countdown}".
 func (rr Renderer) Window(w usage.Window, now time.Time) string {
-	line := fmt.Sprintf("%-*s%s    %5.1f%%", labelWidth, w.Label, rr.bar(w.Utilization), w.Utilization)
-	if w.ResetsAt != nil {
+	return rr.window(w, now, false)
+}
+
+// window renders one window, as a plain reading or — when bounded — as a ceiling.
+//
+// A bounded window carries a "≤" and drops its countdown. Both follow from the
+// reading being old: a recorded percentage only decays as usage ages out of a
+// rolling window, so the true figure is at or below it; and the reset time it
+// was recorded with is not a fixed deadline (Codex slides the weekly anchor
+// forward), so counting down to it would invent a precision the data lacks.
+// This assumes nothing was spent from another machine or the web app in the
+// meantime — usage the session logs never see, and the one way the real figure
+// could instead be higher.
+func (rr Renderer) window(w usage.Window, now time.Time, bounded bool) string {
+	pct := fmt.Sprintf("%.1f%%", w.Utilization)
+	if bounded {
+		pct = "≤" + pct
+	}
+	line := fmt.Sprintf("%-*s%s%s", labelWidth, w.Label, rr.bar(w.Utilization), padLeft(pct, pctWidth))
+	if w.ResetsAt != nil && !bounded {
 		line += "   " + rr.dim(countdown(*w.ResetsAt, now))
 	}
 	return line
+}
+
+// padLeft right-aligns s in a field width columns wide, counting runes rather
+// than bytes so a multi-byte prefix like "≤" lines up with plain percentages
+// instead of shifting them by the extra bytes it occupies.
+func padLeft(s string, width int) string {
+	if n := width - utf8.RuneCountInString(s); n > 0 {
+		return strings.Repeat(" ", n) + s
+	}
+	return s
 }
 
 // Extra formats a non-window line (e.g. credits): a label plus a dimmed value,

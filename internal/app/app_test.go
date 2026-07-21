@@ -2,15 +2,19 @@ package app
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"ai-usage/internal/render"
+	"ai-usage/internal/usage"
 )
 
 // clock is the fixed "now" all reset countdowns are computed against.
@@ -90,9 +94,13 @@ func sessionsWith(t *testing.T, files map[string]string, order []string) string 
 func baseDeps(out, errOut *bytes.Buffer) Deps {
 	return Deps{
 		HTTPClient: http.DefaultClient,
-		Now:        func() time.Time { return clock },
-		Out:        out,
-		Err:        errOut,
+		// Fail the live read by default so these tests exercise the session-log
+		// fallback against their fixtures instead of spawning a real
+		// `codex app-server` and asserting on the machine's actual usage.
+		CodexLive: func() (json.RawMessage, error) { return nil, errors.New("live disabled in tests") },
+		Now:       func() time.Time { return clock },
+		Out:       out,
+		Err:       errOut,
 	}
 }
 
@@ -200,6 +208,35 @@ func TestCodexStaleSnapshotShowsAgeNote(t *testing.T) {
 	)
 	if out.String() != want {
 		t.Errorf("stale codex output mismatch:\n got:\n%s\nwant:\n%s", out.String(), want)
+	}
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+}
+
+// Codex 0.144 emits a single weekly window, whose seven-day reset can outlive
+// the last session by days, so nothing resets and the result is not stale. The
+// weekly is a rolling window that decays as usage ages out, which makes a
+// five-day-old reading a ceiling rather than a measurement: it must render with
+// a "≤" and its age, not as a confident number beside a live countdown.
+func TestCodexOldWeeklyWindowRendersAsUpperBound(t *testing.T) {
+	old := fmt.Sprintf(`{"timestamp":"2026-06-25T12:00:00Z","payload":{"type":"token_count","rate_limits":{`+
+		`"limit_id":"codex","primary":{"used_percent":18.0,"window_minutes":10080,"resets_at":%d},`+
+		`"secondary":null,"credits":null}}}`,
+		clock.Add(22*time.Hour).Unix())
+
+	var out, errOut bytes.Buffer
+	d := baseDeps(&out, &errOut)
+	d.SessionsDir = sessionsWith(t, map[string]string{"a.jsonl": old}, []string{"a.jsonl"})
+
+	code := Run(d, ModeCodex)
+
+	want := join(
+		"Weekly        ███░░░░░░░░░░░░░░░░░    ≤18.0%",
+		"as of Jun 25 (5 days ago) — actual is lower",
+	)
+	if out.String() != want {
+		t.Errorf("bounded codex output mismatch:\n got:\n%s\nwant:\n%s", out.String(), want)
 	}
 	if code != 0 {
 		t.Errorf("exit = %d, want 0", code)
@@ -356,6 +393,49 @@ func TestCodexFallsThroughToOlderFileWhenNewestHasNoSnapshot(t *testing.T) {
 	}
 	if !bytes.Contains(out.Bytes(), []byte(" 11.0%")) {
 		t.Errorf("expected fallback to the older file's snapshot:\n%s", out.String())
+	}
+}
+
+// fakeProvider answers after a fixed delay, so a test can control which
+// provider finishes first independently of where it sits in the list.
+type fakeProvider struct {
+	name  string
+	delay time.Duration
+}
+
+func (f fakeProvider) Name() string { return f.name }
+
+func (f fakeProvider) Fetch() (usage.Result, error) {
+	time.Sleep(f.delay)
+	return usage.Result{Windows: []usage.Window{{Label: "Weekly", Utilization: 1}}}, nil
+}
+
+// The combined view fetches providers concurrently, so it must cost the slower
+// of them rather than the sum, and must still lay them out in list order rather
+// than in the order their answers arrived.
+func TestCombinedFetchesConcurrentlyAndKeepsOrder(t *testing.T) {
+	const delay = 150 * time.Millisecond
+	var out, errOut bytes.Buffer
+	d := baseDeps(&out, &errOut)
+
+	start := time.Now()
+	code := runCombined(d, render.New(false), []usage.Provider{
+		fakeProvider{name: "Slow", delay: delay},
+		fakeProvider{name: "Fast", delay: 0},
+	}, clock)
+	elapsed := time.Since(start)
+
+	if code != 0 {
+		t.Errorf("exit = %d, want 0", code)
+	}
+	if elapsed >= 2*delay {
+		t.Errorf("took %v, want under %v: providers were fetched in sequence", elapsed, 2*delay)
+	}
+	slowAt := strings.Index(out.String(), "Slow")
+	fastAt := strings.Index(out.String(), "Fast")
+	if slowAt < 0 || fastAt < 0 || slowAt > fastAt {
+		t.Errorf("sections out of order (Slow at %d, Fast at %d); want list order, not completion order:\n%s",
+			slowAt, fastAt, out.String())
 	}
 }
 
